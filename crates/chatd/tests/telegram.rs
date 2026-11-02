@@ -1072,6 +1072,42 @@ fn pickers_and_sending_with_files_options_and_picks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A send whose file is a voice message this client recorded: uploaded as any file, sent as a
+/// voice note whose audio attribute carries the facts the recorder read, and the way the
+/// message comes back shows the row as it would on Telegram.
+#[test]
+fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    let send = |client_id: &str, text: &str, with: protocol::Outgoing| {
+        let asked = Request::Send { conversation: key("u7002"), client_id: client_id.into(), text: text.into(), reply_to: None, with };
+        assert!(matches!(world.ask(asked), Response::Sent { .. }));
+        world.until(&format!("send {client_id}"), || {
+            world.messages("u7002").into_iter().find(|message| message.client_id.as_deref() == Some(client_id) && message.state != SendState::Pending)
+        })
+    };
+    let dir = std::path::absolute(format!("/tmp/tinyclient-tg-voice-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("voice-1234.opus");
+    std::fs::write(&path, vec![7u8; 2048]).unwrap();
+    let one = protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false };
+    // Bars at the widest and shut: both are exact through Telegram's five bits a bar.
+    let voice = protocol::VoiceNote { duration: 7_500, waveform: vec![255, 0, 255, 0, 255, 0, 255, 0] };
+    let sent = send("8201", "", protocol::Outgoing { files: vec![one], voice: Some(voice), ..Default::default() });
+    assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
+    assert_eq!(world.called("SaveFilePart 0 2048"), 1, "{:?}", world.calls());
+    assert_eq!(world.called("SendMedia u7002 voice-note:7"), 1, "the audio attribute, and no file name: {:?}", world.calls());
+    let attachment = sent.attachments.first().unwrap();
+    assert_eq!((attachment.name.as_str(), attachment.mime.as_str()), ("Voice message", "audio/ogg"));
+    assert_eq!(attachment.file.kind, protocol::MediaKind::Audio);
+    assert_eq!(attachment.duration, 7);
+    assert_eq!(attachment.waveform, vec![255, 0, 255, 0, 255, 0, 255, 0]);
+    // The file's own name is not sent, and not shown either.
+    assert!(!attachment.name.contains("opus"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_session_ended_elsewhere_keeps_what_was_read_and_signing_out_ends_it_on_telegram() {
     let world = World::signed_in();

@@ -1685,12 +1685,52 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
     match media {
         tl::enums::InputMedia::UploadedPhoto(one) => (if one.spoiler { "photo+spoiler" } else { "photo" }.to_owned(), photo(one.spoiler)),
         tl::enums::InputMedia::UploadedDocument(one) => {
-            let name = one.attributes.iter().find_map(|attribute| match attribute {
-                tl::enums::DocumentAttribute::Filename(name) => Some(name.file_name.clone()),
+            let audio = one.attributes.iter().find_map(|attribute| match attribute {
+                tl::enums::DocumentAttribute::Audio(audio) if audio.voice => Some(audio.clone()),
                 _ => None,
             });
             let kind = if one.force_file { "file" } else { "document" };
-            (format!("{kind}:{}", one.mime_type), file(&name.unwrap_or_default(), &one.mime_type))
+            let (kind, media) = match audio {
+                // A voice note keeps only its audio attribute on the wire, as Telegram's own.
+                Some(audio) => {
+                    let kept = tl::types::Document {
+                        id,
+                        access_hash: id + 1,
+                        file_reference: vec![9],
+                        date: T0,
+                        mime_type: one.mime_type.clone(),
+                        size: 18_000,
+                        thumbs: None,
+                        video_thumbs: None,
+                        dc_id: 2,
+                        attributes: vec![audio.clone().into()],
+                    };
+                    (
+                        format!("voice-note:{}", audio.duration),
+                        tl::types::MessageMediaDocument {
+                            nopremium: false,
+                            spoiler: false,
+                            video: false,
+                            round: false,
+                            voice: true,
+                            document: Some(kept.into()),
+                            alt_documents: None,
+                            video_cover: None,
+                            video_timestamp: None,
+                            ttl_seconds: None,
+                        }
+                        .into(),
+                    )
+                }
+                None => {
+                    let name = one.attributes.iter().find_map(|attribute| match attribute {
+                        tl::enums::DocumentAttribute::Filename(name) => Some(name.file_name.clone()),
+                        _ => None,
+                    });
+                    (format!("{kind}:{}", one.mime_type), file(&name.unwrap_or_default(), &one.mime_type))
+                }
+            };
+            (kind, media)
         }
         tl::enums::InputMedia::Photo(one) => (if one.spoiler { "kept-photo+spoiler" } else { "kept-photo" }.to_owned(), photo(one.spoiler)),
         tl::enums::InputMedia::Document(one) => match &one.id {

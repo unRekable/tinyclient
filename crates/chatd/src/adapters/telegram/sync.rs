@@ -182,6 +182,7 @@ fn capabilities(premium: bool) -> Capabilities {
         edit_window: 48 * 3_600,
         file_scan: false,
         allow_archives: false,
+        voice_notes: true,
     }
 }
 
