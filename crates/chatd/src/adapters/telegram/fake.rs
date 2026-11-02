@@ -12,11 +12,11 @@
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
 //! (9001, muted, with a sponsored message) with a linked discussion group "Field Notes chat"
-//! (9003, which the comments on its post come from); a forum "Workshop" (9002) with topics
-//! General and "Tools" (31). The phone +1 555 010 0142 signs in with the code 24680; +1 555 010
-//! 0199 also wants the password "correct horse". Username resolution serves only `gif` and
-//! `forest_wren`; `flood_wait` returns a flood wait, and every other name returns
-//! USERNAME_NOT_OCCUPIED.
+//! (9003, which the comments on its post come from, heard of at `getDiscussionMessage`); a
+//! forum "Workshop" (9002) with topics General and "Tools" (31). The phone +1 555 010 0142
+//! signs in with the code 24680; +1 555 010 0199 also wants the password "correct horse".
+//! Username resolution serves only `gif` and `forest_wren`; `flood_wait` returns a flood wait,
+//! and every other name returns USERNAME_NOT_OCCUPIED.
 
 use super::peers::Who;
 use super::wire::{Event, Fault, Wire};
@@ -39,6 +39,9 @@ const NOTES: i64 = 9001;
 const WORKSHOP: i64 = 9002;
 /// "Field Notes chat", the channel's linked discussion group: where its post's comments live.
 const CHATTERS: i64 = 9003;
+/// The post's echo in the discussion group: the message a send answers, and the id the echo
+/// test looks for (`GetDiscussionMessage` names it for the open, the send for its reply).
+const ECHO: i32 = 60;
 const TOOLS: i32 = 31;
 /// Telegram's own account, a bot, and an account Telegram flags as a scam.
 const SERVICE: i64 = 777_000;
@@ -159,6 +162,9 @@ fn chats() -> Vec<tl::enums::Chat> {
             notes
         }),
         tl::enums::Chat::Channel(a_channel(WORKSHOP, "Workshop", false, true, "")),
+        // The discussion group the channel's post's comments are written into: a megagroup,
+        // learned whole from the answers that name it, so its hash ready for a send.
+        tl::enums::Chat::Channel(a_channel(CHATTERS, "Field Notes chat", false, false, "")),
     ]
 }
 
@@ -415,6 +421,9 @@ impl World {
             all.push(named);
             all.push(new);
         }
+        if peer == Who::Channel(CHATTERS) {
+            count_raised(self, events, &mut all);
+        }
         answer(updates(all))
     }
 
@@ -565,6 +574,54 @@ fn all_drafts(world: &World) -> Result<Vec<u8>, Fault> {
         })
         .collect();
     answer(updates(all))
+}
+
+/// What `getDiscussionMessage` answers for a channel post: the echo of the post, spoken in
+/// the discussion group as Telegram forwards it there, leading the thread — the id a send
+/// answers, learned when the thread is opened.
+#[inline(never)]
+fn discussion_answer(place: &str) -> Result<Vec<u8>, Fault> {
+    if place != key(Who::Channel(NOTES), Some(5)) {
+        return Err(rpc(400, "MESSAGE_ID_INVALID", None));
+    }
+    let mut echo = message(Who::Channel(CHATTERS), ECHO, ME, T0 - 7_200, "Snow line is at 1,900 m this week.");
+    // The echo is the channel's post standing in the group: no author of its own, and the
+    // forward header names the post it says again.
+    echo.from_id = None;
+    echo.out = false;
+    let mut from: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(T0 - 7_200)]);
+    from.from_id = Some(Who::Channel(NOTES).peer());
+    from.channel_post = Some(5);
+    echo.fwd_from = Some(from.into());
+    let found = tl::types::messages::DiscussionMessage {
+        messages: vec![echo.into()],
+        max_id: Some(51),
+        read_inbox_max_id: Some(0),
+        read_outbox_max_id: None,
+        unread_count: 0,
+        chats: chats(),
+        users: users(),
+    };
+    answer(tl::enums::messages::DiscussionMessage::Message(found))
+}
+
+/// A comment went in the discussion group: the count of the post rises on the edit of it
+/// Telegram tells then, on the update stream and with the answer, the way the count of any
+/// post's comments keeps current (`comment_thread` keeps the id that opens the thread).
+fn count_raised(world: &mut World, events: &Sender<Event>, all: &mut Vec<tl::enums::Update>) {
+    let Some(tl::enums::Message::Message(mut post)) =
+        world.messages.get(&key(Who::Channel(NOTES), None)).and_then(|held| held.get(&5)).cloned()
+    else {
+        return;
+    };
+    if let Some(tl::enums::MessageReplies::Replies(info)) = &mut post.replies {
+        info.replies += 1;
+    }
+    world.store(None, post.clone());
+    let raised: tl::enums::Update =
+        tl::types::UpdateEditChannelMessage { message: post.into(), pts: 0, pts_count: 0 }.into();
+    let _ = events.send(update(raised.clone()));
+    all.push(raised);
 }
 
 /// `saveDraft` keeps a draft as the phone's do, by its conversation and its topic in a forum,
@@ -1134,6 +1191,11 @@ impl World {
             self.log(&format!("GetReplies {place}"));
             return answer(self.page(&place, request.offset_id, request.add_offset, request.limit));
         }
+        if let Some(request) = asked::<f::messages::GetDiscussionMessage>(body) {
+            let place = key(input_who(&request.peer), Some(request.msg_id));
+            self.log(&format!("GetDiscussionMessage {place}"));
+            return discussion_answer(&place);
+        }
         if let Some(request) = asked::<f::messages::GetCustomEmojiDocuments>(body) {
             // A topic's icon picture: the documents the emoji ids name, stills at list size.
             // The animated icon's own id (5002) is what Telegram names an animated emoji:
@@ -1246,7 +1308,13 @@ impl World {
             };
             let options = [("silent", request.silent), ("no-preview", request.no_webpage), ("scheduled", request.schedule_date.is_some())];
             let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
-            self.log(&format!("SendMessage {} {}{options}", key(peer, topic), request.message));
+            // A comment names the echo post it answers in its key, as a forum's send names
+            // its topic: the two are Telegram's own ways to point at a threaded write.
+            let said = match peer == Who::Channel(CHATTERS) {
+                true => key(peer, reply),
+                false => key(peer, topic),
+            };
+            self.log(&format!("SendMessage {said} {}{options}", request.message));
             return self.deliver(events, peer, topic, reply, vec![(request.random_id, request.message, None)], request.schedule_date);
         }
         if let Some(request) = asked::<f::messages::EditMessage>(body) {

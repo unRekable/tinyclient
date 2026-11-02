@@ -604,6 +604,79 @@ fn asking_a_channel_posts_comments_reads_the_discussion_group_under_the_post() {
 }
 
 #[test]
+fn opening_a_comments_thread_asks_telegram_once_where_its_comments_live_and_lets_it_post() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+
+    // Opened: Telegram is asked for the discussion group behind the post and the echo of it
+    // to answer, once, and the row stops saying read-only once it did as much. Reading the
+    // comments themselves goes on under the post's own id, as before.
+    world.messages("c9001_5");
+    world.until("the replies to be read", || {
+        (world.called("GetDiscussionMessage c9001_5") == 1 && world.called("GetReplies c9001_5") == 1).then_some(())
+    });
+    let open = world.until("the row to let a comment in", || {
+        world.conversation("c9001_5").filter(|row| !row.read_only)
+    });
+    assert_eq!((open.kind, open.title.as_str()), (ConversationKind::Thread, "Comments"));
+
+    // Opened again: the answer stands for the connection and nothing is asked again.
+    world.messages("c9001_5");
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.called("GetDiscussionMessage c9001_5"), 1, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_comment_posted_in_the_thread_is_told_as_a_reply_to_the_posts_echo_in_the_discussion_group() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+
+    // The send is Telegram's own for the discussion group: not the channel, and under the
+    // echo of the post itself, the way the phone's apps write a comment.
+    world.send("c9001_5", "9002", "Sunset push", None);
+    world.until("the comment to be told", || {
+        world.calls().contains(&"SendMessage c9003_60 Sunset push".to_owned()).then_some(())
+    });
+    // The echo was learned with the thread's open: the send asked Telegram nothing of it again.
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.called("GetDiscussionMessage c9001_5"), 1, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_sent_comment_lands_in_the_thread_and_the_posts_count_rises_under_its_own_id() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+
+    // The echo Telegram sends lands as the thread's comment, not as a message of the
+    // discussion group's own list; the quote line a comment answers in the post's echo is
+    // the thread's own anchor and names nobody.
+    world.send("c9001_5", "8001", "Sunset push", None);
+    let sent = world.until("the comment in the thread", || {
+        world.messages("c9001_5").into_iter().find(|comment| comment.text == "Sunset push" && comment.state == SendState::Sent)
+    });
+    assert_eq!((sent.outgoing, sent.reply_to.is_none()), (true, true), "{sent:?}");
+
+    // Telegram raised the count on the post itself, without moving the id the footer
+    // opens the thread under.
+    let post = world.until("the count to rise", || {
+        world.message("c9001", "5").filter(|post| post.thread.as_ref().is_some_and(|section| section.replies == 3))
+    });
+    let section = post.thread.as_ref().unwrap();
+    assert_eq!(section.id.as_str(), "c9001_5");
+    assert_eq!(world.conversation("c9001_5").unwrap().root.as_deref(), Some("5"));
+}
+
+#[test]
 fn a_chat_pinned_by_a_folder_beyond_the_pages_gets_its_row() {
     // The Work folder pins a chat that no dialog page the sign-on read carries: only the
     // folder rule speaks of it, and what nothing stored says of is asked for alone.

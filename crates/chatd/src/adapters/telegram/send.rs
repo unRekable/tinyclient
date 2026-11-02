@@ -64,6 +64,9 @@ struct Target {
 fn target(account: &Account, conversation: &str, reply_to: Option<&str>) -> Result<Target, Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None })?;
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
+    // The comments of a channel post are held in the discussion group behind it: like a
+    // forum's send names its topic, theirs names the echo of the post there.
+    let (who, topic) = super::sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));
     Ok(Target { who, peer: account.input(who)?, reply_to: reply_header(reply, topic) })
 }
 

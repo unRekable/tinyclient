@@ -22,6 +22,9 @@ const NEAR_END: usize = 30;
 const TOPICS: i32 = 50;
 /// A `HistoryAfter` for the same place is not asked again within this long.
 const AFTER_FRESH: Duration = Duration::from_secs(60);
+/// Where a comments thread writes through, held for the connection: capped, as everything
+/// the account holds while it lives.
+const DISCUSSIONS: usize = 32;
 /// Telegram's own rule: a channel's sponsored messages are asked again at most this often.
 const ADS_FRESH: Duration = Duration::from_secs(300);
 /// Rows whose newest message is fetched for one `Previews`, and the pause between them.
@@ -753,12 +756,14 @@ fn quote(account: &Account, conversation: &str, page: &HashMap<i32, (String, Str
     }
 }
 
-/// Where a message belongs: its chat, or in a forum the thread of its topic.
+/// Where a message belongs: its chat, in a forum the thread of its topic, and in a
+/// discussion group the thread of the comments a reply of it answers.
 pub(super) fn conversation_of(account: &Account, mapped: &Mapped) -> String {
     match mapped.peer {
         Who::Channel(_) if account.dir().get(mapped.peer).is_some_and(|known| known.forum) => {
             thread_id(mapped.peer, mapped.topic.unwrap_or(1))
         }
+        Who::Channel(_) => comments_thread(account, mapped).unwrap_or_else(|| mapped.peer.text()),
         peer => peer.text(),
     }
 }
@@ -766,7 +771,13 @@ pub(super) fn conversation_of(account: &Account, mapped: &Mapped) -> String {
 /// Finishes a mapped message for the conversation it goes to: the reply's line.
 pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped, page: &HashMap<i32, (String, String, String)>) {
     if let Some(reply) = mapped.reply {
-        mapped.message.reply_to = Some(quote(account, conversation, page, reply));
+        // The echo of the post is the thread's own anchor, not a message anyone has before
+        // them: a comment that answers the post carries no quote line for it. A comment
+        // answering another comment in the thread names that one.
+        let anchor = account.live().discussion.iter().any(|(held, _, echo)| *held == conversation && *echo == reply);
+        if !anchor {
+            mapped.message.reply_to = Some(quote(account, conversation, page, reply));
+        }
     }
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
@@ -794,10 +805,80 @@ fn comment_thread(account: &Account, conversation: &str, mapped: &mut Mapped) {
     let mut row = ConversationRow::new(id, ConversationKind::Thread, "Comments");
     row.parent = Some(mapped.peer.text());
     row.root = Some(mapped.message.id.clone());
-    // Reading is what this client opens the comments for: writing into the discussion group
-    // behind them, with the post's echo there, is its own step, so the composer stays shut.
+    // The row stands shut until the open of it learned where its comments go: without
+    // that, a comment has nowhere to be written in Telegram's own terms.
     row.read_only = true;
     let _ = account.ctx.conversation(&row);
+}
+
+/// The discussion group behind a channel post and the echo of the post there: what
+/// `getDiscussionMessage` names for the thread. Asked once (the cache of the connection
+/// holds the answer), for its sends and for the comments Telegram maps back into it.
+fn discussion(account: &Account, channel: Who, post: i32) -> Result<(Who, i32), Fault> {
+    let thread = thread_id(channel, post);
+    let held = account.live().discussion.iter().find(|(place, _, _)| *place == thread).map(|(_, who, echo)| (*who, *echo));
+    if let Some(held) = held {
+        return Ok(held);
+    }
+    let request = tl::functions::messages::GetDiscussionMessage { peer: account.input(channel)?, msg_id: post };
+    let tl::enums::messages::DiscussionMessage::Message(found) = account.ask(&request)?;
+    account.learn(&found.users, &found.chats);
+    // The answer leads with the post itself, standing in the group: the id in it is what
+    // a send answers, and the group it stands in is where a send goes.
+    let Some((group, echo)) = found.messages.iter().find_map(|message| match message {
+        tl::enums::Message::Message(echo) => Some((Who::of(&echo.peer_id), echo.id)),
+        _ => None,
+    }) else {
+        return Err(Fault::Net("Telegram said the discussion with nothing in it.".to_owned()));
+    };
+    let mut live = account.live();
+    if live.discussion.len() >= DISCUSSIONS {
+        live.discussion.clear();
+    }
+    live.discussion.push_back((thread, group, echo));
+    Ok((group, echo))
+}
+
+/// Where a send in a comments thread goes: the discussion group behind the post, answering
+/// the echo of the post there, as Telegram's own apps keep them. `None` for any other
+/// conversation, which sends under its own peer and header.
+pub(super) fn comment_target(account: &Account, conversation: &str) -> Result<Option<(Who, i32)>, Fault> {
+    let Some((who @ Who::Channel(_), Some(post))) = Who::parse(conversation) else {
+        return Ok(None);
+    };
+    // A broadcast channel, and not a forum: its threads are the comments of a post, which
+    // are held in the linked discussion group.
+    if !account.dir().get(who).is_some_and(|known| known.broadcast) {
+        return Ok(None);
+    }
+    Ok(Some(discussion(account, who, post)?))
+}
+
+/// The row of a comments thread was written read-only, because a comment had nowhere to
+/// go until Telegram named the discussion group behind the post. It does now: an open
+/// that got its answer says post, once, and keeps everything else the row stood for.
+fn comment_row(account: &Account, thread: &str, channel: Who, post: i32) {
+    let Ok(Some(row)) = account.ctx.known(thread) else {
+        return;
+    };
+    if !row.read_only {
+        return;
+    }
+    let mut fresh = ConversationRow::new(thread, ConversationKind::Thread, row.title.as_str());
+    fresh.parent = Some(channel.text());
+    fresh.root = Some(post.to_string());
+    let _ = account.ctx.conversation(&fresh);
+}
+
+/// The comments thread a message in the discussion group belongs to: one already opened
+/// names the echo its reply answers. `None` leaves the message with the group's own id,
+/// for a conversation of the group itself.
+fn comments_thread(account: &Account, mapped: &Mapped) -> Option<String> {
+    let Some(echo) = mapped.reply else {
+        return None;
+    };
+    let live = account.live();
+    live.discussion.iter().find(|(_, held, at)| *held == mapped.peer && *at == echo).map(|(thread, _, _)| thread.clone())
 }
 
 /// The footer's "last reply": the newest comment's time, written onto the post it hangs off
@@ -940,6 +1021,17 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
             tracing::warn!("chatd: Telegram: topics: {fault}");
         }
         return;
+    }
+    // A comments thread under a channel post: its open asks Telegram once where the
+    // comments are written — the row said read-only until it did — and with the answer
+    // the page of the thread reads as any other's, under the post's id as before.
+    if broadcast {
+        if let Some(post) = topic {
+            match discussion(account, who, post) {
+                Ok(_) => comment_row(account, conversation, who, post),
+                Err(fault) => tracing::warn!("chatd: Telegram: comments: {fault}"),
+            }
+        }
     }
     let newest = history(account, conversation, Around::Newest);
     // The sponsored post belongs at the foot of the channel's own page; a comments thread

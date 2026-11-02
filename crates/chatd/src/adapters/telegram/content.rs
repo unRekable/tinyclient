@@ -471,8 +471,10 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.mentions_me = raw.mentioned;
             message.reactions = raw.reactions.as_ref().map(reactions).unwrap_or_default();
             // A channel post's comment section rides the post: the count alone comes with it,
-            // the linked group is named but never reached, and the comments are read under the
-            // post's own id (`messages.getReplies`, which takes the channel and the post).
+            // the linked group named on the wire but not used here. The comments are read
+            // under the post's own id (`messages.getReplies`, which takes the channel and
+            // the post) and written into the discussion group behind it: the sends' ask of
+            // them is `sync::discussion`'s.
             if let Some(tl::enums::MessageReplies::Replies(info)) = &raw.replies {
                 if info.channel_id.is_some() {
                     message.thread = Some(ThreadSummary {
