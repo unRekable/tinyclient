@@ -30,8 +30,11 @@ fn now_ms() -> u64 {
 /// it is making, and whether that file is still wanted.
 struct Active {
     stdin: Option<Box<dyn io::Write + Send>>,
-    /// False once the recording was replaced or forgotten: the file goes once mediad is done.
+    /// False once the recording was replaced or forgotten: the file goes once mediad is done,
+    /// unless its facts arrived — a finished note's file stays for the send it was named by.
     keep: Arc<AtomicBool>,
+    /// True once mediad said the file is made (or failed): anything of the send is told by it.
+    said: Arc<AtomicBool>,
     recording: Recording,
     path: PathBuf,
 }
@@ -131,8 +134,14 @@ impl Recorder {
     fn running(&self, hub: &Arc<Hub>, recording: &Recording, path: &Path, spawned: protocol::media_host::Spawned) {
         let protocol::media_host::Spawned { mut child, stdin, stdout } = spawned;
         let mut stdout = BufReader::new(stdout.expect("stdout is piped"));
-        let active = Active { stdin, keep: Arc::new(AtomicBool::new(true)), recording: recording.clone(), path: path.to_owned() };
-        let keep = active.keep.clone();
+        let active = Active {
+            stdin,
+            keep: Arc::new(AtomicBool::new(true)),
+            said: Arc::new(AtomicBool::new(false)),
+            recording: recording.clone(),
+            path: path.to_owned(),
+        };
+        let (keep, said) = (active.keep.clone(), active.said.clone());
         *lock(&self.active) = Some(active);
         // Ends when mediad exits, which it does when chatd closes our stdin.
         let hub = hub.clone();
@@ -143,8 +152,9 @@ impl Recorder {
                 hub.recorder.reported(&hub, &recording, &path, event);
             }
             let _ = child.wait();
-            if !keep.load(Ordering::Relaxed) {
-                // Best effort: a recording nobody wants leaves no file at all.
+            if !keep.load(Ordering::Relaxed) && !said.load(Ordering::Relaxed) {
+                // Best effort: a recording nobody kept (replaced or forgotten while running)
+                // leaves no file at all. A finished note's file stays: a send may still hold it.
                 let _ = std::fs::remove_file(&path);
             }
         });
@@ -174,13 +184,17 @@ impl Recorder {
         self.tell(hub);
     }
 
-    /// A word from the mediad of a recording. A word about one that no longer runs — replaced.
+    /// A word from the mediad of a recording. A word about one that no longer runs is not
+    /// shown; whatever was reported goes on record, for the file's fate and the shell's shown.
     fn reported(&self, hub: &Arc<Hub>, recording: &Recording, path: &Path, event: RecEvent) {
         let hearing = {
             let mut shown = lock(&self.shown);
             let active = lock(&self.active);
             match (active.as_ref(), shown.as_mut()) {
-                (Some(active), Some(shown)) if active.recording == *recording => heard(shown, active, &event),
+                (Some(active), Some(shown)) if active.recording == *recording => {
+                    active.said.store(true, Ordering::Relaxed);
+                    heard(shown, active, &event)
+                }
                 _ => {
                     let _ = path;
                     false
@@ -203,7 +217,13 @@ mod tests {
     }
 
     fn active(recording: Recording, path: &str) -> Active {
-        Active { stdin: None, keep: Arc::new(AtomicBool::new(true)), recording: recording.clone(), path: PathBuf::from(path) }
+        Active {
+            stdin: None,
+            keep: Arc::new(AtomicBool::new(true)),
+            said: Arc::new(AtomicBool::new(false)),
+            recording: recording.clone(),
+            path: PathBuf::from(path),
+        }
     }
 
     #[test]
