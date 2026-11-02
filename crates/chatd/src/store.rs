@@ -2819,8 +2819,14 @@ impl Store {
                 params![word(&conversation.network), conversation.account, conversation.id, KEEP_MESSAGES],
             )?;
         }
-        // A thread goes with its first message, unless the user opened it lately.
-        let aged = "t.parent != '' AND t.root != '' AND t.opened < ?1 AND NOT EXISTS
+        // A thread goes with its first message, unless the user opened it lately. A Telegram
+        // forum's own topics are not that: their parent holds no messages at all, so they are
+        // never aged out by this rule and stand as long as the forum does.
+        let aged = "t.parent != '' AND t.root != '' AND t.opened < ?1
+                AND EXISTS (SELECT 1 FROM conversation p
+                     WHERE p.network = t.network AND p.account = t.account
+                       AND p.id = t.parent AND p.kind != 'forum')
+                AND NOT EXISTS
                 (SELECT 1 FROM message r
                   WHERE r.network = t.network AND r.account = t.account
                     AND r.conversation = t.parent AND r.id = t.root)";
@@ -3415,6 +3421,39 @@ mod tests {
         assert!(store.message(&key, "1").unwrap().is_none());
         assert!(store.message(&key, "2").unwrap().is_some());
         assert!(store.message(&opened, "1").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_forum_topic_stands_while_its_forum_does_even_untouched_for_months() {
+        // Topics are Threads whose parent forum holds no messages at all: the aged-thread rule
+        // reads "its first message is gone", which never applied here. What the user opens
+        // every day must not lose its topics to a night's retention pass.
+        let (mut store, key) = store();
+        let account = key.account();
+        let forum = Key::new(&account, "c9002");
+        let topic = Key::new(&account, "c9002_31");
+        let row = ConversationRow::new("c9002", ConversationKind::Forum, "The forum");
+        store.upsert_conversation(&account, &row).unwrap();
+        let mut topic_row = ConversationRow::new("c9002_31", ConversationKind::Thread, "The topic");
+        topic_row.parent = Some("c9002".into());
+        topic_row.root = Some("31".into());
+        store.upsert_conversation(&account, &topic_row).unwrap();
+
+        // The topic was never opened (opened stays 0), and the forum holds no messages.
+        assert_eq!(store.prune(NOW, KEEP_DAYS as u32).unwrap(), 0);
+        assert!(store.conversation(&topic).unwrap().is_some(), "the topic stands");
+
+        // A Discord-shaped thread (parent is a channel, its first message pruned by age)
+        // still goes the old way...
+        let talked = ConversationRow::new("chan", ConversationKind::Channel, "The channel");
+        store.upsert_conversation(&account, &talked).unwrap();
+        let mut thread = ConversationRow::new("chan_t", ConversationKind::Thread, "The thread");
+        thread.parent = Some("chan".into());
+        thread.root = Some("7".into());
+        store.upsert_conversation(&account, &thread).unwrap();
+        let _ = store.prune(NOW, KEEP_DAYS as u32).unwrap();
+        assert!(store.conversation(&Key::new(&account, "chan_t")).unwrap().is_none(), "the old kind of thread still goes");
+        assert!(store.conversation(&topic).unwrap().is_some(), "the topic survives run after run");
     }
 
     #[test]
