@@ -440,6 +440,28 @@ fn the_next_page_is_asked_while_the_current_one_is_written() {
 }
 
 #[test]
+fn the_prune_runs_after_the_chats_are_served() {
+    // A message older than retention ever keeps here: Telegram's pages carry no conversation
+    // for it, and a prune at boot would carry it off while the sign-on is still writing chats.
+    let world = World::seed(Some(SESSION), "30", &[], |store| {
+        let long_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - 200 * 86_400;
+        let message = Message::plain("old-letter", "Long gone", "Wrote this before tinyclient.", long_ago, false);
+        store.ingest(&key("u6543"), &message, false).unwrap();
+    });
+    world.connected();
+    // The chats of the boot are on the list and the old message stands: retention did not run
+    // inside the boot that served them.
+    let prunable = |days: u32| match world.ask(Request::Prunable { days }) {
+        Response::Prunable { messages, .. } => messages,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(prunable(90), 1, "{:#?}", world.calls());
+    // And retention still runs, at once when its setting asks it to.
+    world.ask(Request::Set { scope: String::new(), key: "keep_days".to_owned(), value: Some("7".to_owned()) });
+    world.until("the old message to be pruned", || (prunable(90) == 0).then_some(()));
+}
+
+#[test]
 fn a_pin_or_a_folder_change_is_told_row_by_row_and_never_rereads_the_chats() {
     let world = World::signed_in();
     world.connected();

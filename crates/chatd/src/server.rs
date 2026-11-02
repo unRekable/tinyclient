@@ -265,20 +265,29 @@ impl Chat {
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
         // Whatever was on its way when chatd last stopped did not go.
         let _ = chat.hub.store().fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
-        // Retention runs behind the socket, at start, once a day, and when its setting changes.
-        // A sleeping thread costs nothing in between.
+        // Retention runs behind the socket, about a minute after the boot, then once a day,
+        // and when its setting changes. Never inside the boot: the sign-on writes months of
+        // chats into the store while this would be deleting rows of it. A thread sleeping
+        // between the runs costs nothing.
+        const AFTER_BOOT: Duration = Duration::from_secs(60);
         let hub = chat.hub.clone();
-        std::thread::spawn(move || loop {
-            let days = hub.settings().number(settings::KEEP_DAYS);
-            match hub.store().prune(now(), days) {
-                Ok(0) | Err(_) => {}
-                Ok(gone) => {
-                    tracing::warn!("chatd: pruned {gone} old messages");
-                    // What is on screen may be gone.
-                    hub.reset();
+        std::thread::spawn(move || {
+            let mut first = true;
+            loop {
+                // The boot's sign-in has the store busy; the first pass waits it out, and a
+                // setting change wakes an earlier run through the same wait.
+                hub.prune_due(if first { AFTER_BOOT } else { Duration::from_secs(86_400) });
+                first = false;
+                let days = hub.settings().number(settings::KEEP_DAYS);
+                match hub.store().prune(now(), days) {
+                    Ok(0) | Err(_) => {}
+                    Ok(gone) => {
+                        tracing::warn!("chatd: pruned {gone} old messages");
+                        // What is on screen may be gone.
+                        hub.reset();
+                    }
                 }
             }
-            hub.prune_due(Duration::from_secs(86_400));
         });
         chat
     }
