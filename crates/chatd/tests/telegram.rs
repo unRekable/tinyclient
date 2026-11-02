@@ -48,17 +48,53 @@ impl World {
         World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_MANY", &many.to_string())])
     }
 
+    /// `many` more chats, with every chats page after the first held at the wire until the test
+    /// lets them go: the pages then land apart, as they do on a real network.
+    fn held(many: u32) -> World {
+        World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_MANY", &many.to_string()), ("TINYCLIENT_TELEGRAM_HOLD", "1")])
+    }
+
+    /// `many` more chats, and the group's dialog ask held. The store here already read the
+    /// group further than Telegram now says, so the writing of that row asks for its dialog
+    /// again and stalls mid-page until the test lets the ask through.
+    fn stalled(many: u32) -> World {
+        World::seed(
+            Some(SESSION),
+            "30",
+            &[("TINYCLIENT_TELEGRAM_MANY", &many.to_string()), ("TINYCLIENT_TELEGRAM_PEER_HOLD", "1")],
+            |store| {
+                let far = key("g8001");
+                let row = chatd::store::ConversationRow::new("g8001", ConversationKind::Group, "Trail crew");
+                store.upsert_conversation(&far.account(), &row).unwrap();
+                // The read has to be written fresh: a count that changes nothing is no write.
+                store.set_counts(&far, 0, 0, Some("25"), 1).unwrap();
+            },
+        )
+    }
+
     /// `session` is the stored sign-in, if any; `qr_seconds` how long the fake's QR codes last.
     fn start(session: Option<&str>, qr_seconds: &str) -> World {
         World::with(session, qr_seconds, &[])
     }
 
     fn with(session: Option<&str>, qr_seconds: &str, env: &[(&str, &str)]) -> World {
+        World::seed(session, qr_seconds, env, |_| {})
+    }
+
+    /// `seed` writes the store of a run that is not the first, as the boot of an account
+    /// already signed in carries one.
+    fn seed(
+        session: Option<&str>,
+        qr_seconds: &str,
+        env: &[(&str, &str)],
+        seed: impl FnOnce(&mut chatd::store::Store),
+    ) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // On Windows "/tmp" has no drive; chatd takes only absolute paths.
         let dir = std::path::absolute(format!("/tmp/tinyclient-tg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        seed(&mut chatd::store::Store::open(&dir.join("chat.sqlite")).unwrap());
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
         command
@@ -359,6 +395,48 @@ fn chats_past_the_newest_500_load_as_the_list_scrolls_with_their_pictures() {
     world.rows_on_screen(&["u100300"]);
     sleep(Duration::from_millis(300));
     assert_eq!(world.called("GetDialogs 0"), 6);
+}
+
+#[test]
+fn a_chats_list_paints_what_it_has_while_the_pages_arrive() {
+    // Five pages of the main list at sign-on; every page after the first is held at the wire.
+    let world = World::held(650);
+    let (_, seq) = world.status();
+    // Nothing waits for the whole list: what the first page landed is on the list already.
+    world.until("the chats of the first page", || world.conversation("u100091").map(drop));
+    // And it was told as it landed: the change feed carries the row before the list is whole.
+    world.changed(seq, "the change of a first-page chat", |change| match change {
+        Change::Conversation { conversation } if conversation.id == "u100091" => Some(()),
+        _ => None,
+    });
+    assert!(world.conversation("u100050").is_some(), "{:#?}", world.calls());
+    // The sign-on is still inside the chats: nothing past them was asked while a page waits.
+    assert_eq!(world.called("GetContacts"), 0, "{:#?}", world.calls());
+    // Let through, the rest of the chats and the archive are read and the sign-on finishes.
+    world.steer("dialogs-go");
+    world.connected();
+    let known = |at: u32| world.conversation(&format!("u{}", 100_000 + at)).is_some();
+    world.until("the newest 500", || known(491).then_some(()));
+    assert_eq!((world.called("GetDialogs 0"), world.called("GetDialogs 1")), (5, 1), "{:#?}", world.calls());
+}
+
+#[test]
+fn the_next_page_is_asked_while_the_current_one_is_written() {
+    // The group's row is written only after its dialog was asked again (the store's read is
+    // ahead of what the page says), and that ask is held at the wire: the writing of the page
+    // sits on it the way any page's writing can on a slower network or a busy database.
+    let world = World::stalled(650);
+    world.until("the group's read to be told again", || (world.called("ReadHistory g8001 25") == 1).then_some(()));
+    // While the page is still being written, the one after it is already at the wire.
+    world.within(Duration::from_secs(3), "the page after to be asked", || {
+        world.calls().iter().any(|call| call.starts_with("GetDialogs 0 u100091")).then_some(())
+    });
+    // When the ask goes through, the writing carries on and the sign-on finishes, one chat's
+    // dialog asked only once.
+    world.steer("peer-go");
+    world.connected();
+    assert_eq!(world.called("GetDialogs 0"), 5, "{:#?}", world.calls());
+    assert_eq!(world.called("GetPeerDialogs g8001"), 1, "{:#?}", world.calls());
 }
 
 #[test]

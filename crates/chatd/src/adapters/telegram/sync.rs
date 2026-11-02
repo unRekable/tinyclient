@@ -10,6 +10,8 @@ use crate::store::{ConversationRow, Filing, PreviewLine};
 use grammers_tl_types as tl;
 use protocol::{CallSupport, Capabilities, Card, ConversationKind, EmojiScope, MediaFile, MediaKind, Message, Relation, ReplyTo, Span, Special, Style, Watching};
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Pages of the main list read at sign-on, a hundred chats each: the newest 500. The rest are
@@ -191,7 +193,7 @@ fn capabilities(premium: bool) -> Capabilities {
 
 /// The first requests of a connection: are we still signed in, who are we, what is muted by
 /// default, the chats, the contacts.
-pub(super) fn sign_on(account: &Account) -> Result<(), Fault> {
+pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     account.ask(&tl::functions::updates::GetState {})?;
     let me = account.ask(&tl::functions::users::GetUsers { id: vec![tl::enums::InputUser::UserSelf] })?;
     account.learn(&me, &[]);
@@ -273,6 +275,9 @@ struct Page {
     more: bool,
 }
 
+/// One page of a list, and where the next page starts, if Telegram has one.
+type PageRead = (Page, Option<Cursor>);
+
 fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::InputPeer)) -> Result<Page, Fault> {
     let request = tl::functions::messages::GetDialogs {
         exclude_pinned: false,
@@ -314,8 +319,9 @@ fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::In
 /// Reads the chats at sign-on (and again when a default mute changed): the folders first, so
 /// every row is written once with its filing; then the newest 500 of the main list and the
 /// newest of the archive. Each row names its folders, its pin and whether it is archived;
-/// nothing is grouped.
-pub(super) fn dialogs(account: &Account) -> Result<(), Fault> {
+/// nothing is grouped. A page is written while the one after it is asked for, so the lists
+/// paint what exists as it exists, and the boot does not wait for the writing it need not.
+pub(super) fn dialogs(account: &Arc<Account>) -> Result<(), Fault> {
     let rules = match filing::ask_rules(account) {
         Ok(rules) => rules,
         Err(fault) if fault.flood().is_some() || fault.signed_out() => return Err(fault),
@@ -323,15 +329,26 @@ pub(super) fn dialogs(account: &Account) -> Result<(), Fault> {
     };
     account.live().filed = Filed { rules, ..Filed::default() };
     filing::report(account);
-    for (list, pages) in [(0, DIALOG_PAGES), (1, ARCHIVE_PAGES)] {
+    for (list, most) in [(0usize, DIALOG_PAGES), (1usize, ARCHIVE_PAGES)] {
         let mut offset = None;
-        for _ in 0..pages {
-            match read_page(account, list, offset)? {
-                Some(next) => offset = Some(next),
-                None => break,
+        let mut inflight = Some(ask_page(account, list, offset));
+        let mut caught = 0usize;
+        while caught < most {
+            let read = match inflight.take() {
+                Some(landed) => landed.recv().unwrap_or_else(|_| Err(Fault::Net("the page ask ended".into()))),
+                None => fetch_page(account, list, offset),
+            };
+            let (mut page, next) = read?;
+            caught += 1;
+            // The page after this one is asked while this one is written, so long as more of
+            // the list is due at sign-on.
+            if next.is_some() && caught < most && !account.ctx.stopped() {
+                inflight = Some(ask_page(account, list, next));
             }
-            if account.ctx.stopped() {
-                break;
+            record_page(account, list, &mut page, next);
+            match next {
+                Some(next) if caught < most && !account.ctx.stopped() => offset = Some(next),
+                _ => break,
             }
         }
     }
@@ -387,29 +404,63 @@ fn pinned_missing(account: &Account) {
     }
 }
 
-/// One page of a list (0 the main list, 1 the archive) from `offset`, written row by row.
-/// Answers where the next page starts, if Telegram has one.
+/// One page of a list (0 the main list, 1 the archive) from `offset`, read whole and written
+/// whole, as the scrolling list reads it. Answers where the next page starts, if Telegram has
+/// one.
 fn read_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<Option<Cursor>, Fault> {
+    let (mut page, next) = fetch_page(account, list, offset)?;
+    record_page(account, list, &mut page, next);
+    Ok(next)
+}
+
+/// One page read (0 the main list, 1 the archive) from `offset`, with nothing written yet:
+/// its dialogs in the order Telegram gave, and where the next page starts, if Telegram has
+/// one. The next page is asked before this one is written, so the sign-on is not chained to
+/// the writing of every page it asked for.
+fn fetch_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<PageRead, Fault> {
     let start = match offset {
         Some((date, id, who)) => (date, id, account.input(who).unwrap_or(tl::enums::InputPeer::Empty)),
         None => (0, 0, tl::enums::InputPeer::Empty),
     };
-    let mut page = page(account, Some(list as i32), start)?;
-    let mut next = None;
+    let page = page(account, Some(list as i32), start)?;
+    let next = page.dialogs.last().and_then(|dialog| {
+        let who = Who::of(&dialog.peer);
+        let date = match page.newest.get(&(who, dialog.top_message)) {
+            Some(tl::enums::Message::Message(newest)) => newest.date,
+            Some(tl::enums::Message::Service(newest)) => newest.date,
+            _ => 0,
+        };
+        Some((date, dialog.top_message, who))
+    });
+    let next = next.filter(|_| page.more);
+    Ok((page, next))
+}
+
+/// The next page, read on its own so it is at the wire while the page before it is written.
+/// Answers on a channel of its own; where no thread could be had, the page is read where the
+/// caller stands, as the sign-on always did.
+fn ask_page(account: &Arc<Account>, list: usize, offset: Option<Cursor>) -> Receiver<Result<PageRead, Fault>> {
+    let (sent, landed) = channel();
+    let spare = sent.clone();
+    let speak = account.clone();
+    let asked = std::thread::Builder::new().name("telegram-pages".into()).spawn(move || {
+        let _ = sent.send(fetch_page(&speak, list, offset));
+    });
+    if asked.is_err() {
+        let _ = spare.send(fetch_page(account, list, offset));
+    }
+    landed
+}
+
+/// A page of the list, written row by row after it was read: its dialogs in the order Telegram
+/// gave, and then where the list goes on.
+fn record_page(account: &Account, list: usize, page: &mut Page, next: Option<Cursor>) {
     for dialog in std::mem::take(&mut page.dialogs) {
         let who = Who::of(&dialog.peer);
         let newest = page.newest.remove(&(who, dialog.top_message));
-        let date = match &newest {
-            Some(tl::enums::Message::Message(message)) => message.date,
-            Some(tl::enums::Message::Service(message)) => message.date,
-            _ => 0,
-        };
-        next = Some((date, dialog.top_message, who));
         record(account, list, &dialog, newest.as_ref());
     }
-    let next = next.filter(|_| page.more);
     account.live().filed.ends[list] = next;
-    Ok(next)
 }
 
 /// One dialog to the store: its row with its filing, its newest message, counts, mute and

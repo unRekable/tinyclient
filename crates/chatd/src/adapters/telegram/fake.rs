@@ -6,8 +6,10 @@
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`, `poll`, `voice`,
-//! `forward`, `flood-send N`, `revoke`). Every request it is sent is appended
-//! to `telegram.calls`, one line each, so a test can see what the network would have heard.
+//! `forward`, `flood-send N`, `revoke`, and the holds of `TINYCLIENT_TELEGRAM_HOLD` and
+//! `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and `peer-go`). Every request it is
+//! sent is appended to `telegram.calls`, one line each, so a test can see what the network
+//! would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
@@ -28,7 +30,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, PoisonError, Mutex};
 use tl::{Deserializable, Identifiable, RemoteCall, Serializable};
 
 const ME: i64 = 7001;
@@ -110,6 +112,11 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
 /// How many extra chats the account has, for the tests of a long chat list.
 fn crowd() -> i64 {
     std::env::var("TINYCLIENT_TELEGRAM_MANY").ok().and_then(|many| many.parse().ok()).unwrap_or(0)
+}
+
+/// The tests say which asks may be held at the wire until they steer them through.
+fn held_at_wire(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|held| held == "1")
 }
 
 fn users() -> Vec<tl::enums::User> {
@@ -295,6 +302,9 @@ struct World {
     /// told by `saveDraft` from here. The key is whose, and in a forum which topic.
     drafts: HashMap<(Who, Option<i32>), String>,
     calls: PathBuf,
+    /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
+    dialogs_go: bool,
+    peer_go: bool,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -320,6 +330,8 @@ impl World {
             lost_reads: false,
             drafts: HashMap::new(),
             calls: protocol::support_dir().join("telegram.calls"),
+            dialogs_go: false,
+            peer_go: false,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, T0 - 300, "Are you coming to the ridge on Saturday?"));
@@ -647,6 +659,12 @@ pub struct Fake {
     heard: Mutex<Option<Receiver<Event>>>,
     closed: Arc<AtomicBool>,
     control: PathBuf,
+    /// The tests say a page may be held at the wire (`TINYCLIENT_TELEGRAM_HOLD`,
+    /// `TINYCLIENT_TELEGRAM_PEER_HOLD`), until a line steers it through.
+    hold_pages: bool,
+    hold_peer_dialogs: bool,
+    /// Wakes an answer held at the wire when the test steers.
+    wake: Arc<Condvar>,
 }
 
 impl Fake {
@@ -660,6 +678,9 @@ impl Fake {
             heard: Mutex::new(Some(heard)),
             closed: Arc::default(),
             control,
+            hold_pages: held_at_wire("TINYCLIENT_TELEGRAM_HOLD"),
+            hold_peer_dialogs: held_at_wire("TINYCLIENT_TELEGRAM_PEER_HOLD"),
+            wake: Arc::new(Condvar::new()),
         };
         fake.listen();
         fake
@@ -667,7 +688,8 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; dropping the wire ends it.
     fn listen(&self) {
-        let (world, events, closed, control) = (self.world.clone(), self.events.clone(), self.closed.clone(), self.control.clone());
+        let (world, events, closed, control, wake) =
+            (self.world.clone(), self.events.clone(), self.closed.clone(), self.control.clone(), self.wake.clone());
         let _ = std::thread::Builder::new().name("telegram-fake".into()).spawn(move || {
             script::follow(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
@@ -678,10 +700,32 @@ impl Fake {
                     for event in world.steer(line.trim()) {
                         let _ = events.send(event);
                     }
+                    drop(world);
+                    wake.notify_all();
                 }
                 true
             });
         });
+    }
+
+    /// Sleeps on the asks whose answers the test holds (`dialogs-go`, `peer-go`), saying what
+    /// Telegram was asked as it is asked, whatever the hold.
+    fn hold_back(&self, body: &[u8]) {
+        if !self.hold_pages && !self.hold_peer_dialogs {
+            return;
+        }
+        let world = self.world.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The guard comes back when the test let the ask through, and its own drop sits here.
+        drop(self.wake.wait_while(world, |world| self.is_held(body, world)).unwrap_or_else(PoisonError::into_inner));
+    }
+
+    /// Whether this ask's answer waits for the test to let it through.
+    fn is_held(&self, body: &[u8], world: &World) -> bool {
+        use tl::functions as f;
+        // The chats' first page, and every later one after the `dialogs-go`; a chat's dialog
+        // asked again until the `peer-go`.
+        (self.hold_pages && asked::<f::messages::GetDialogs>(body).is_some_and(|request| !matches!(request.offset_peer, tl::enums::InputPeer::Empty)) && !world.dialogs_go)
+            || (self.hold_peer_dialogs && asked::<f::messages::GetPeerDialogs>(body).is_some() && !world.peer_go)
     }
 }
 
@@ -710,6 +754,15 @@ impl World {
             "scan-password" => {
                 self.scanned = Some(true);
                 vec![update(tl::enums::Update::LoginToken)]
+            }
+            // The held answers go through, as the test says (`World::held`, `World::stalled`).
+            "dialogs-go" => {
+                self.dialogs_go = true;
+                Vec::new()
+            }
+            "peer-go" => {
+                self.peer_go = true;
+                Vec::new()
             }
             // Bold on an accented word, a link on an emoji, a mention by id, code, a spoiler.
             "incoming" => {
@@ -1812,7 +1865,11 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
 
 impl Wire for Fake {
     fn invoke(&self, _dc: Option<i32>, body: Vec<u8>) -> Result<Vec<u8>, Fault> {
-        self.world.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).handle(&body, &self.events)
+        let answer = self.world.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).handle(&body, &self.events);
+        // An answer the test holds sleeps here, with the world's lock left open so the test
+        // can steer and read the calls meanwhile.
+        self.hold_back(&body);
+        answer
     }
 
     fn events(&self) -> Option<Receiver<Event>> {
