@@ -190,10 +190,14 @@ mod tests {
         while source.read(&mut heard).unwrap() {}
         let seconds = heard.len() as f64 / 2. / crate::RATE as f64;
         assert!((0.4..1.3).contains(&seconds), "{seconds} s heard");
-        eprintln!("heard: {} first {:?}", heard.len(), &heard[..6.min(heard.len())], heard.iter().map(f32::abs).reduce(f32::max).unwrap_or(0.));
+        // The reader hands stereo; the test hears one ear to a mono line.
+        let mono: Vec<f32> = heard.chunks_exact(2).map(|pair| (pair[0] + pair[1]) / 2.).collect();
+        eprintln!("mono: {} first {:?} loudest {:?}", mono.len(), mono[..3.min(mono.len())].to_vec(), mono.iter().fold(0f32, |a, b| a.max(*b)));
         // Rising zero crossings of what was heard a second: the 440 Hz the stand-in makes.
-        let rising = heard.chunks_exact(2).filter(|pair| pair[0] < 0. && pair[1] >= 0.).count();
-        let pitch = rising as f64 * crate::RATE as f64 / (heard.len() as f64 / 2.);
+        // A crossing between two samples is half-seen by a pair window, so twice as many go
+        // by as are counted here.
+        let rising = mono.chunks_exact(2).filter(|pair| pair[0] < 0. && pair[1] >= 0.).count();
+        let pitch = rising as f64 * 2. * crate::RATE as f64 / (mono.len() as f64).max(1.);
         assert!((380. ..500.).contains(&pitch), "{pitch} Hz");
         // Mono is the same in both ears, as a voice note is.
         assert!(heard.chunks_exact(2).all(|pair| (pair[0] - pair[1]).abs() < 0.001));
