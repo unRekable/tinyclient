@@ -2255,6 +2255,11 @@ impl Chat {
                 Ok(()) => Response::Ok,
                 Err(detail) => error(ErrorCode::Media, detail),
             },
+            // Answered `Ok` whatever became of it: the recording's own word is `Change::Recording`.
+            Request::Record(request) => {
+                self.hub.recorder.request(&self.hub, &support_dir().join("media"), request);
+                Response::Ok
+            }
             Request::Media(request) => {
                 let asked = match request {
                     // Joining is the adapter's to ask for, with what the network handed out.
