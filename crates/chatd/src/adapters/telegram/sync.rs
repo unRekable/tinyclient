@@ -694,10 +694,9 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
             return;
         }
     };
-    // What is fetched is whatever the icon can be drawn from: the still thumbnail Telegram
-    // names in the document ("m" first) when it names one, and the document whole otherwise —
-    // an animated icon is its Lottie JSON the same play the messages render, gzip unpacked
-    // where the file lands.
+    // What is fetched is the icon whole: the emoji's animated document (its Lottie play), so
+    // the tile animates like the official apps', and a still icon is the same file whole.
+    // The still thumbnail is neither: it is smaller than the play it belongs to.
     let wants = icons.into_iter().filter_map(|(icon, topic_row)| {
         // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
         let document = documents.iter().find(|document| match document {
@@ -707,16 +706,7 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
         let tl::enums::Document::Document(document) = document else {
             return None;
         };
-        let still = document.thumbs.as_ref().and_then(|thumbs| {
-            thumbs.iter().find_map(|thumb| match thumb {
-                tl::enums::PhotoSize::Size(size) if size.r#type == "m" => Some(size.r#type.clone()),
-                _ => None,
-            }).or_else(|| thumbs.iter().find_map(|thumb| match thumb {
-                tl::enums::PhotoSize::Size(size) => Some(size.r#type.clone()),
-                _ => None,
-            }))
-        });
-        let thumb_size = still.unwrap_or_default();
+        let thumb_size = String::new();
         Some(Want {
             file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
             dc: document.dc_id,

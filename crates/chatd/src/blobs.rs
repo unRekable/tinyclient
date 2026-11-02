@@ -153,6 +153,35 @@ pub fn path_of(media: &Path, account: &AccountKey, id: &str) -> PathBuf {
     dir_under(media, account).join(name_of(id))
 }
 
+/// Where the small files the shell re-draws (a topic's animated icon) are kept: the bytes'
+/// own mark rides the name, so a refetch with different content lands at another path. A
+/// shell that holds the file decoded under a name alone would show an old picture; with the
+/// mark it knows that what landed is new. The mark is read back from `part`, a piece at a
+/// time, so a large file is hashed without being held whole.
+pub fn path_of_file(media: &Path, account: &AccountKey, id: &str, part: &Path) -> Option<PathBuf> {
+    let mut held = std::fs::File::open(part).ok()?;
+    let mut chunk = [0u8; 64 * 1024];
+    let mut mark = 0xcbf2_9ce4_8422_2325u64;
+    loop {
+        match std::io::Read::read(&mut held, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                for byte in &chunk[..n] {
+                    mark = (mark ^ *byte as u64).wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(dir_under(media, account).join(format!("{}-{:08x}", name_of(id), mark as u32)))
+}
+
+/// Whether a kept file is of an older naming pass: named by its id alone (16 hex marks)
+/// instead of its content's own mark. Such a file is a candidate for the dustbin.
+pub fn name_is_dated(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()).map_or(true, |name| name.len() == 16)
+}
+
 /// Where the cache keeps what it fetched from `url`. Another size of the same picture is
 /// another address and so another path: a shell that holds the smaller one decoded can tell
 /// that what landed is new.

@@ -176,12 +176,24 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
             }
         }
     }
+    // A file kept by its id alone is from an older fetch and does not carry today's
+    // bytes: thrown away, so the fetch of this turn keeps what was asked for.
+    if want.file.kind == MediaKind::Emoji {
+        let paths: Vec<String> = ctx.hub.store().media(&ctx.account, id).unwrap_or_default()
+            .into_iter().filter_map(|(file, _)| file.path).collect();
+        for one in paths {
+            let held = std::path::PathBuf::from(&one);
+            if blobs::name_is_dated(&held) {
+                let _ = std::fs::remove_file(&held);
+            }
+        }
+    }
     if on_disk(ctx) {
         return Ok(());
     }
     let local = |err: std::io::Error| Fault::Net(format!("the file could not be kept: {err}"));
-    let path = blobs::path_of(&media_dir(), &ctx.account, &want.file.id);
-    let part = path.with_extension("part");
+    let slot = blobs::path_of(&media_dir(), &ctx.account, &want.file.id);
+    let part = slot.with_extension("part");
     std::fs::create_dir_all(blobs::dir_under(&media_dir(), &ctx.account)).map_err(local)?;
     let mut out = std::fs::File::create(&part).map_err(local)?;
     let written = match &want.inline {
@@ -211,6 +223,8 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
         }
         _ => bytes,
     };
+    let path = blobs::path_of_file(&media_dir(), &ctx.account, &want.file.id, &part)
+        .ok_or_else(|| local(std::io::Error::new(std::io::ErrorKind::Other, "the file's mark could not be hashed")))?;
     if let Err(err) = std::fs::rename(&part, &path) {
         let _ = std::fs::remove_file(&part);
         return Err(local(err));
