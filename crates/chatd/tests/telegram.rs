@@ -655,6 +655,35 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
 }
 
 #[test]
+fn a_custom_emoji_reactions_document_is_asked_and_its_file_lands_for_the_chip() {
+    let world = World::signed_in();
+    world.connected();
+    // The conversation is on screen, so the reaction's picture is asked for as it arrives.
+    world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    world.until("history", || world.message("u7002", "12"));
+    let before = world.called("GetCustomEmojiDocuments");
+    // A reaction that is a custom emoji arrives: its document is named in one batch, and the
+    // reaction carries the media the chip draws (`e<document id>`), stills keep their text.
+    world.steer("custom-react");
+    let reacted = world.until("the custom reaction", || {
+        world.message("u7002", "12").filter(|message| message.reactions.iter().any(|have| have.file.is_some()))
+    });
+    let seen: Vec<(&str, &str)> = reacted.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.file.as_ref().map_or("", |file| file.id.as_str()))).collect();
+    assert_eq!(seen, vec![("👍", ""), (":emoji:", "e5002")]);
+    world.until("the emoji document asked for", || (world.called("GetCustomEmojiDocuments") > before).then_some(()));
+    // The file is fetched whole (the animated document) and kept under the name the
+    // reaction carries, unpacked from the gzip Telegram serves it in.
+    let landed = world.until("the reaction picture on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    let kept = std::fs::read(&landed).expect("the reaction picture is on disk");
+    assert!(kept.starts_with(b"{"), "what a chip draws is the file inside: {:02x?}", &kept[..kept.len().min(8)]);
+}
+
+#[test]
 fn a_channel_posts_comments_count_rides_the_post() {
     let world = World::signed_in();
     world.connected();

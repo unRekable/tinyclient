@@ -802,6 +802,27 @@ impl World {
                 };
                 vec![update(tl::types::UpdateMessageReactions { peer: odalys.peer(), msg_id: 13, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() }.into())]
             }
+            "custom-react" => {
+                let count = |reaction: tl::enums::Reaction, count, mine: bool| {
+                    tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                        chosen_order: mine.then_some(0),
+                        reaction,
+                        count,
+                    })
+                };
+                let reactions = tl::types::MessageReactions {
+                    min: false,
+                    can_see_list: true,
+                    reactions_as_tags: false,
+                    results: vec![
+                        count(tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: "👍".to_owned() }), 2, false),
+                        count(tl::enums::Reaction::CustomEmoji(tl::types::ReactionCustomEmoji { document_id: 5002 }), 1, false),
+                    ],
+                    recent_reactions: None,
+                    top_reactors: None,
+                };
+                vec![update(tl::types::UpdateMessageReactions { peer: odalys.peer(), msg_id: 12, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() }.into())]
+            }
             "edit" => {
                 let mut message = message(odalys, 13, ODALYS, T0 + 10, "Café at the dock, seven sharp");
                 message.edit_date = Some(T0 + 30);

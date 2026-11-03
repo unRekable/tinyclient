@@ -715,6 +715,46 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
     Ok(count)
 }
 
+/// An emoji document asked whole: the animated file itself (its Lottie play), so the tile
+/// animates like the official apps', and a still emoji is the same file whole. The still
+/// thumbnail inside the document is neither: it is smaller than the play it belongs to.
+fn emoji_want(document: &tl::types::Document, row: Option<String>) -> Want {
+    Want {
+        file: MediaFile::new(format!("e{}", document.id), MediaKind::Emoji),
+        dc: document.dc_id,
+        location: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
+            id: document.id,
+            access_hash: document.access_hash,
+            file_reference: document.file_reference.clone(),
+            thumb_size: String::new(),
+        }),
+        inline: None,
+        row,
+        original: false,
+    }
+}
+
+/// The custom emoji a set of document ids names, asked in one batch. Telegram answers only
+/// what it knows; an error leaves the caller without documents (the tiles fall back to text).
+fn emoji_documents(account: &Account, ids: &[i64], why: &str) -> Vec<tl::types::Document> {
+    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: ids.to_vec() }) {
+        Ok(documents) => documents,
+        Err(fault) => {
+            eprintln!("chatd: Telegram: {why}: {fault}");
+            return Vec::new();
+        }
+    };
+    documents.into_iter().map(|document| match document {
+        tl::enums::Document::Document(document) => Some(document),
+        tl::enums::Document::Empty(_) => None,
+    }).flatten().collect()
+}
+
+/// The documents an id asks of a set: Telegram answers only the emoji it still keeps.
+fn documents_of<'a>(documents: &'a [tl::types::Document], id: i64) -> Option<&'a tl::types::Document> {
+    documents.iter().find(|document| document.id == id)
+}
+
 /// The topics' own pictures: one request for every icon the pages say, and a fetch for each
 /// that is not on disk yet (the same file may hang off several topics). The pictures are the
 /// emoji documents Telegram names in the topic list, small and shown at list size.
@@ -735,46 +775,33 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
         }
         icons.push((icon, row));
     }
-    let emoji_ids: Vec<i64> = icons.iter().map(|(icon, _)| *icon).collect();
-    let mut emoji_ids = emoji_ids;
-    emoji_ids.sort_unstable();
-    emoji_ids.dedup();
-    if emoji_ids.is_empty() {
+    let mut ids = icons.iter().map(|(icon, _)| *icon).collect::<Vec<i64>>();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
         return;
     }
-    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: emoji_ids }) {
-        Ok(documents) => documents,
-        Err(fault) => {
-            eprintln!("chatd: Telegram: topic icons: {fault}");
-            return;
-        }
-    };
-    // What is fetched is the icon whole: the emoji's animated document (its Lottie play), so
-    // the tile animates like the official apps', and a still icon is the same file whole.
-    // The still thumbnail is neither: it is smaller than the play it belongs to.
-    let wants = icons.into_iter().filter_map(|(icon, topic_row)| {
-        // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
-        let document = documents.iter().find(|document| match document {
-            tl::enums::Document::Document(document) => document.id == icon,
-            _ => false,
-        })?;
-        let tl::enums::Document::Document(document) = document else {
-            return None;
-        };
-        let thumb_size = String::new();
-        Some(Want {
-            file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
-            dc: document.dc_id,
-            location: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
-                id: document.id,
-                access_hash: document.access_hash,
-                file_reference: document.file_reference.clone(),
-                thumb_size,
-            }),
-            inline: None,
-            row: Some(topic_row),
-            original: false,
-        })
+    let documents = emoji_documents(account, &ids, "topic icons");
+    // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
+    let wants = icons.iter().filter_map(|(icon, row)| {
+        documents_of(&documents, *icon).map(|document| emoji_want(document, Some(row.clone())))
+    }).collect();
+    account.files.want(wants);
+}
+
+/// A reaction's custom emoji: its document asked for and the file fetched into the media
+/// cache under the same name the reaction carries, whole, the way a topic's icon is. The
+/// rows read again when the pictures land, and the chips draw them instead of `:emoji:`.
+pub(super) fn reaction_emoji(account: &Account, conversation: &str, messages: &[Message]) {
+    let mut ids = messages.iter().flat_map(|message| content::reaction_emoji_ids(&message.reactions)).collect::<Vec<i64>>();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return;
+    }
+    let documents = emoji_documents(account, &ids, "reaction emoji");
+    let wants = ids.iter().filter_map(|id| {
+        documents_of(&documents, *id).map(|document| emoji_want(document, Some(conversation.to_owned())))
     }).collect();
     account.files.want(wants);
 }
@@ -1051,6 +1078,9 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     }
     wants.extend(avatar(account, who));
     wants.extend(authors.into_iter().take(20).filter_map(|author| avatar(account, author)));
+    // The reactions' custom emoji on this page: their files land for the chips while the
+    // user is looking at the conversation.
+    reaction_emoji(account, conversation, &messages);
     account.files.want(wants);
     messages.into_iter().next()
 }
