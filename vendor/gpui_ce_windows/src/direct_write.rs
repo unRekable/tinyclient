@@ -91,7 +91,7 @@ impl DirectWriteTextSystem {
             "Segoe UI",
             BitmapFallbackGlyphRasterizer::new(SharedDirectWriteRenderer(renderer.clone())),
         )
-        .with_fallback_families(["Segoe UI Symbol", "Lilex", "IBM Plex Sans", "Arial"]);
+        .with_fallback_families(["Segoe UI Emoji", "Segoe UI Symbol", "Lilex", "IBM Plex Sans", "Arial"]);
 
         Ok(Self { parley, renderer })
     }
