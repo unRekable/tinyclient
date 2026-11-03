@@ -2576,6 +2576,7 @@ impl Composer {
                     reply_to: None,
                     chips: Vec::new(),
                     made: Vec::new(),
+                    note: false,
                 };
                 self.dispatch(out, with, cx);
             }
