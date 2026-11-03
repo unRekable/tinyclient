@@ -785,6 +785,10 @@ fn a_sent_comment_lands_in_the_thread_and_the_posts_count_rises_under_its_own_id
     world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
     world.messages("c9001_5");
     world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+    // The resolve answered: the flip of the row's own read-only word follows it onto the
+    // store. A send that asked before it would be refused, and rightly so - the test waits
+    // for the row the way a window does.
+    world.until("the thread to be postable", || world.conversation("c9001_5").filter(|row| !row.read_only).map(|_| ()));
 
     // The echo Telegram sends lands as the thread's comment, not as a message of the
     // discussion group's own list; the quote line a comment answers in the post's echo is
